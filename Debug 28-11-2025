@@ -253,9 +253,8 @@ class Home(QtWidgets.QMainWindow):
         self.contador_type1 = 0
         self.contador_type2 = 0
         self.contador_type3 = 0
-        self.estado_t1 = 0
-        self.estado_t2 = 0
-        self.estado_t3 = 0
+
+        self.secuenciaAGV_activa = False
 
         uic.loadUi("C:/Users/Ricardo Cabrera/Desktop/prueba2.0/Home.ui", self)
         self.setWindowTitle('Ventana principal')
@@ -337,24 +336,31 @@ class Home(QtWidgets.QMainWindow):
             except Exception as e:
                 self.statusbar.showMessage(f"Error: {e}")
     
-    def procesar_deteccion(self, tipo_detectado): 
+    def procesar_deteccion(self, tipo_detectado):
         print(f"Señal recibida en Main: {tipo_detectado}")
-        
-        # Aquí tienes acceso limpio a tus clientes Modbus definidos en Home
-        if tipo_detectado == "Type1":
-            self.activar_piston_seguro(V_Clasf1)
-            self.contador_type1  = self.contador_type1 + 1
-            
-            if self.contador_type1 >= 5:
-                self.Secuencia_tipo1()
-            
-        elif tipo_detectado == "Type2":
-            self.activar_piston_seguro(V_Clasf2)
-            self.contador_type2  = self.contador_type2 + 1
-            
-        elif tipo_detectado == "Type3":
-            self.activar_piston_seguro(V_Clasf3)
-            self.contador_type3  = self.contador_type3 + 1
+
+        pistones = {"Type1": V_Clasf1, 
+                    "Type2": V_Clasf2, 
+                    "Type3": V_Clasf3
+        }
+        self.activar_piston_seguro(pistones[tipo_detectado])
+
+        contadores_map = {"Type1": "contador_type1", 
+                          "Type2": "contador_type2", 
+                          "Type3": "contador_type3"
+        }
+        contador_attr = contadores_map[tipo_detectado]
+        setattr(self, contador_attr, getattr(self, contador_attr) + 1)
+
+        secuencias_map = {"Type1": self.secuencia_tipo1,
+                          "Type2": self.secuencia_tipo2,
+                          "Type3": self.secuencia_tipo3
+        }
+
+
+        if getattr(self, contador_attr) >= 5:
+            setattr(self, contador_attr, getattr(self, contador_attr) - 5)
+            threading.Thread(target=secuencias_map[tipo_detectado], daemon=True).start()
 
     def activar_piston_seguro(self, direccion_coil):
         def _accion():
@@ -368,15 +374,54 @@ class Home(QtWidgets.QMainWindow):
 
         threading.Thread(target=_accion, daemon=True).start()
 
-    def Secuencia_tipo1(self):
-        self.client3.write_coil(V_Llamar_AGV_T1, 1)
+    def activar_servo_temporal(self, direccion_coil, duracion = 3):
+        def _accion():
+            self.client2.write_coil(direccion_coil, 1)
+            print(f"Servo {direccion_coil} activado")
+            time.sleep(duracion)
+            self.client2.write_coil(direccion_coil, 0)
+            print(f"Servo {direccion_coil} desactivado")
+    
+        threading.Thread(target=_accion, daemon=True).start()
 
-        if self.client3.read_coil(V_AGV_Llego):
-            self.client3.write_coil(V_Llamar_AGV_T1, 0)
-            self.estado_t1 = 10
+    def secuencia_tipo1(self):
+        if self.secuenciaAGV_activa:
+            print("Secuencia ya en ejecución, saliendo")
+            return
+    
+        self.secuenciaAGV_activa = True
+        try:
+            client_agv = self.client3
+            client_cartesiano = self.client4
+            client_servo = self.client2
 
-        if self.estado_t1 == 10:
-            self.client3.write_coil(V_SrvCont1, 1)
+            client_servo.write_coil(V_SrvRiel1, 1)
+            client_agv.write_coil(V_Llamar_AGV_T1, 1)
+            print("Llamando AGV Type1")
+
+        # Esperar llegada
+            while not client_agv.read_coil(V_AGV_Llego):
+                time.sleep(0.1)
+
+            client_agv.write_coil(V_Llamar_AGV_T1, 0)
+            print("AGV Type1 llegó")
+
+        # Activar servo contenedor
+            self.activar_servo_temporal(V_SrvCont1, duracion=3)
+
+        # Esperar AGV en cartesiano
+            while not client_agv.read_coil(V_AGV_En_Cartesiano):
+                time.sleep(0.1)
+
+        # Secuencia cartesiano
+            client_cartesiano.write_coil(V_Cartesiano_Seq_T1, 1)
+            print("Cartesiano Type1 activado")
+
+        #AGV vuelve a home
+            client_agv.write_coil(V_AGV_Go_Home, 1)
+            print("AGV Type1 regresando a home")
+        finally:
+            self.secuenciaAGV_activa = False
 
         
 class ManualModeApp(QtWidgets.QMainWindow):
