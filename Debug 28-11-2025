@@ -1,0 +1,823 @@
+import sys
+from PyQt5 import QtWidgets, uic, QtCore, QtGui
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal, Qt
+from PyQt5.QtGui import QImage, QPixmap
+from pymodbus.client import ModbusTcpClient
+from pymodbus.exceptions import ConnectionException
+import cv2
+import time
+import threading
+from PyQt5.QtWidgets import QApplication, QMainWindow
+import numpy as np
+
+#Mapeo de direcciones
+# 0-30 actuadores
+# 30-50 sensores
+# 50-60 variables de control
+
+# 70-90 variables de comunicacion
+
+#Coils de ESP1
+V_Piston_1 = 0;
+V_Piston_2 = 1;
+V_MotB = 2;
+V_Clasf1 = 3;
+V_Clasf2 = 4;
+V_Clasf3 = 5;
+
+V_SrvRiel1 = 6;
+V_SrvRiel2 = 7;
+V_SrvRiel3 = 8;
+
+V_Secuencia = 50;
+V_ManualMode = 51;
+V_StateRun = 60;
+V_StateStop = 61;
+
+#Coils de ESP2
+V_SrvCont1 = 9;
+V_SrvCont2 = 10;
+V_SrvCont3 = 11;
+
+#Coils ESP3 (AGV)
+V_Llamar_AGV_T1 = 70  # Ven por Azul
+V_Llamar_AGV_T2 = 77  # Ven por Rojo
+V_Llamar_AGV_T3 = 78  # Ven por Verde
+
+V_AGV_Llego = 71   # AGV llegó a la posición de carga (cualquiera)
+V_AGV_En_Cartesiano = 73  # AGV llegó al cartesiano
+V_AGV_Go_Home = 76                # Mandar AGV a casa
+
+#Coils ESP4 (cartesiano)
+V_Recolectar_Contenedor = 83 # Secuencia de quitar el contenedor del AGV
+V_Cartesiano_Seq_T1 = 80     # Secuencia hacia posicion de tipo 1
+V_Cartesiano_Seq_T2 = 81     # Secuencia hacia posicion de tipo 2
+V_Cartesiano_Seq_T3 = 82     # Secuencia hacia posicion de tipo 3
+
+V_Sensor_Piezas_Rack = 84         # AGV terminó de vaciar piezas en rack
+V_AGV_Get_New_Container = 85      # Secuencia de recoleccion de contenedor vacio y lo lleva al AGV
+V_Cartesiano_Dejo_Contenedor = 86 # Señal que manda al dejar el contenedor en AGV
+V_Cartesiano_Home = 87            # Mandar Robot a casa
+
+# Coils no usados
+V_SCount1 = 30;
+V_SCount2 = 31;
+V_SCount3 = 32;
+
+V_BtnStart = 33;
+V_BtnStop = 34;
+V_BtnReset = 35;
+V_Home = 36;
+V_EMERGENCY = 37;
+
+ESTADO_EMERGENCIA = 0;
+
+estado_anterior = {
+    "Type1": False, # Azul
+    "Type2": False, # Rojo
+    "Type3": False  # Verde
+}
+
+contadores = {
+    "Type1": 0, # Azul
+    "Type2": 0, # Rojo
+    "Type3": 0  # Verde
+}
+
+mapa_pistones = {
+    "Type1": V_Clasf1, # Azul
+    "Type2": V_Clasf2, # Rojo
+    "Type3": V_Clasf3  # Verde
+}
+mapa_servos = {
+    "Type1": V_SrvRiel1, 
+    "Type2": V_SrvRiel2, 
+    "Type3": V_SrvRiel3  
+}
+
+class ModbusHandler:
+
+    def __init__(self, ip):
+        self.ip = ip
+        self.client = ModbusTcpClient(ip, timeout=2)
+        self.lock = threading.Lock() # EL SECRETO: Un candado para que los hilos no choquen
+        self.conectar()
+
+    def conectar(self):
+        try:
+            if not self.client.connect():
+                print(f"Fallo conexión inicial con {self.ip}")
+            else:
+                print(f"Conectado a {self.ip}")
+        except Exception as e:
+            print(f"Error conectando a {self.ip}: {e}")
+
+    def write_coil(self, address, value):
+        with self.lock:
+            try:
+                if not self.client.connected: self.client.connect()
+                self.client.write_coil(address, value)
+            except Exception as e:
+                print(f"Error Write {self.ip} addr {address}: {e}")
+
+    def read_coil(self, address):
+        with self.lock:
+            try:
+                if not self.client.connected: self.client.connect()
+                res = self.client.read_coils(address, 1)
+                if not res.isError():
+                    return res.bits[0]
+            except Exception as e:
+                print(f"Error Read {self.ip} addr {address}: {e}")
+            return False # Retorno por defecto si falla
+
+mb_clients = {
+    "ESP32_1": ModbusHandler("192.168.137.47"), # Pistones
+    "ESP32_2": ModbusHandler("192.168.137.44"), # Servos
+    "ESP32_3": ModbusHandler("192.168.137.30"), # AGV
+    "ESP32_4": ModbusHandler("192.168.137.28"), # Cartesiano
+}
+
+for c in mb_clients.values():
+    c.conectar()
+
+def disparar_piston(direccion_coil):
+    def _accion():
+        mb = mb_clients["ESP32_1"]
+        mb.write_coil(direccion_coil, 1)
+        time.sleep(0.5)
+        mb.write_coil(direccion_coil, 0)
+    threading.Thread(target=_accion, daemon=True).start()
+
+def activar_tope_servo(direccion_coil):
+    def _accion_servo():
+        mb = mb_clients["ESP32_2"]
+        mb.write_coil(direccion_coil, 1) # Bloqueado
+        print(f"Tope {direccion_coil} CERRADO.")
+    threading.Thread(target=_accion_servo, daemon=True).start()
+
+def liberar_tope_servo(direccion_coil):
+    mb = mb_clients["ESP32_2"]
+    mb.write_coil(direccion_coil, 0) # Abierto
+
+class VideoThread(QtCore.QThread):
+    change_pixmap_signal = QtCore.pyqtSignal(np.ndarray)
+    deteccion_S = QtCore.pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._run_flag = True
+
+        self.estado_anterior = {"Type1": False, 
+                                "Type2": False, 
+                                "Type3": False}
+
+    def run(self):
+        cap = cv2.VideoCapture(1)
+
+        while self._run_flag:
+            ret, frame = cap.read()
+            if ret:
+                #Voltear la imagen (Espejo)
+                frame = cv2.flip(frame, 1)
+                # deteccion
+                frame_procesado = self.detectar_color_en_rois(frame)
+                #Emitir la señal con la imagen lista
+                self.change_pixmap_signal.emit(frame_procesado)
+            # Control de velocidad
+            # 30 ms = ~33 FPS
+            self.msleep(30)
+        cap.release()
+
+    def stop(self):
+        self._run_flag = False
+        self.wait()
+
+    def detectar_color_en_rois(self, frame):
+        if frame is None: 
+            return frame
+        
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        coordenadas ={
+            "Type1":  (340, 440, 140, 140), # azul
+            "Type2":  (860, 440, 140, 140), # rojo
+            "Type3": (1400, 440, 140, 140)  # verde
+        }
+
+        rangos = {
+            "Type1":  [(np.array([100, 150, 50]), np.array([140, 255, 255]))],
+            "Type2": [(np.array([0, 120, 70]), np.array([10, 255, 255])),
+                      (np.array([170, 80, 80]), np.array([180, 255, 255]))],
+            "Type3":  [(np.array([40, 70, 70]), np.array([90, 255, 255]))]
+        }
+
+        colores_bgr = {
+            "Type1": (255, 0, 0),
+            "Type2": (0, 0, 255),
+            "Type3": (0, 255, 0)
+        }
+        
+        for nombre, (x, y, w, h) in coordenadas.items():
+            if y+h > frame.shape[0] or x+w > frame.shape[1]: 
+                continue
+
+            roi_hsv = hsv_frame[y:y+h, x:x+w]
+
+            mascara_total = None
+            for bajo, alto in rangos[nombre]:
+                m = cv2.inRange(roi_hsv, bajo, alto)
+                mascara_total = m if mascara_total is None else cv2.bitwise_or(mascara_total, m)
+        
+            detectado_ahora = cv2.countNonZero(mascara_total) > (w * h * 0.20)
+            color_borde = colores_bgr[nombre]
+
+            if detectado_ahora and not self.estado_anterior[nombre]:
+                print(f"Vision detectó: {nombre}") # Debug
+                self.deteccion_S.emit(nombre)
+                self.estado_anterior[nombre] = True
+        
+            elif not detectado_ahora:
+                self.estado_anterior[nombre] = False
+
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color_borde, 2)
+            if detectado_ahora:
+                cv2.putText(frame, nombre, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_borde, 2)            
+            
+
+        return frame
+
+class Home(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.contador_type1 = 0
+        self.contador_type2 = 0
+        self.contador_type3 = 0
+        self.estado_t1 = 0
+        self.estado_t2 = 0
+        self.estado_t3 = 0
+
+        uic.loadUi("C:/Users/Ricardo Cabrera/Desktop/prueba2.0/Home.ui", self)
+        self.setWindowTitle('Ventana principal')
+        self.showMaximized()
+        self.client1 = mb_clients["ESP32_1"]
+        self.client2 = mb_clients["ESP32_2"]
+        self.client3 = mb_clients["ESP32_3"]
+        self.client4 = mb_clients["ESP32_4"]
+
+        self.thread = VideoThread()
+        self.thread.change_pixmap_signal.connect(self.actualizar_imagen)
+
+        self.thread.deteccion_S.connect(self.procesar_deteccion)
+        self.thread.start()
+
+        self.manual_mode = ManualModeApp(self)
+        self.mantenimiento = MantenimientoModeApp(self)
+
+
+        self.Btn_Maintenance.clicked.connect(self.Go_to_Maintenance)
+        self.Btn_ManualMode.clicked.connect(self.Go_to_manual)
+        self.Btn_Start.clicked.connect(self.Runsecuency)
+        self.Btn_Stop.clicked.connect(self.StopSecuency)
+
+    def actualizar_imagen(self, cv_img):
+        qt_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        h, w, ch = qt_img.shape
+        p = QImage(qt_img.data, w, h, ch*w, QImage.Format_RGB888).scaled(1341, 689, Qt.KeepAspectRatio)
+        self.label_video.setPixmap(QPixmap.fromImage(p))
+
+    def closeEvent(self, event):
+        self.thread.stop()
+        event.accept()
+
+    def Go_to_Maintenance(self):
+        self.mantenimiento.show()
+        self.hide()
+
+    def Go_to_manual(self):
+        try:
+            In_Secuency = self.client1.read_coil(V_StateRun)
+                # and ESTADO_EMERGENCIA == 0
+            if In_Secuency == False:
+                self.client1.write_coil(V_ManualMode, 1)
+                self.client1.write_coil(V_StateStop, 0)
+                self.manual_mode.show()
+                self.hide()
+            else:
+                QtWidgets.QMessageBox.warning(self, "Bloqueado maquina corriendo")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", str(e))
+
+    def Runsecuency(self):
+        try:
+            self.client1.write_coil(V_StateRun, 1)
+            self.client1.write_coil(V_ManualMode, 0)
+            self.client1.write_coil(V_StateStop, 0)
+
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_StateRun, 1)
+                self.client1.write_coil(V_ManualMode, 0)
+                self.client1.write_coil(V_StateStop, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def StopSecuency(self):
+        try:
+            self.client1.write_coil(V_StateStop, 1)
+            self.client1.write_coil(V_StateRun, 0)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_StateStop, 1)
+                self.client1.write_coil(V_StateRun, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+    
+    def procesar_deteccion(self, tipo_detectado): 
+        print(f"Señal recibida en Main: {tipo_detectado}")
+        
+        # Aquí tienes acceso limpio a tus clientes Modbus definidos en Home
+        if tipo_detectado == "Type1":
+            self.activar_piston_seguro(V_Clasf1)
+            self.contador_type1  = self.contador_type1 + 1
+            
+            if self.contador_type1 >= 5:
+                self.Secuencia_tipo1()
+            
+        elif tipo_detectado == "Type2":
+            self.activar_piston_seguro(V_Clasf2)
+            self.contador_type2  = self.contador_type2 + 1
+            
+        elif tipo_detectado == "Type3":
+            self.activar_piston_seguro(V_Clasf3)
+            self.contador_type3  = self.contador_type3 + 1
+
+    def activar_piston_seguro(self, direccion_coil):
+        def _accion():
+            try:
+                self.client1.write_coil(direccion_coil, 1)
+                time.sleep(0.5)
+                self.client1.write_coil(direccion_coil, 0)
+                print(f"Piston {direccion_coil} disparado.")
+            except Exception as e:
+                print(f"Error Modbus: {e}")
+
+        threading.Thread(target=_accion, daemon=True).start()
+
+    def Secuencia_tipo1(self):
+        self.client3.write_coil(V_Llamar_AGV_T1, 1)
+
+        if self.client3.read_coil(V_AGV_Llego):
+            self.client3.write_coil(V_Llamar_AGV_T1, 0)
+            self.estado_t1 = 10
+
+        if self.estado_t1 == 10:
+            self.client3.write_coil(V_SrvCont1, 1)
+
+        
+class ManualModeApp(QtWidgets.QMainWindow):
+    def __init__(self, main_window):
+        super().__init__()
+        uic.loadUi("C:/Users/Ricardo Cabrera/Desktop/prueba2.0/Manual_mode.ui", self)
+        self.main_window = main_window
+        self.setWindowTitle('Control manual por wifi')
+        self.client1 = mb_clients["ESP32_1"]
+        self.client2 = mb_clients["ESP32_2"]
+        self.client3 = mb_clients["ESP32_3"]
+
+        self.Btn_Home.clicked.connect(self.Go_to_home)
+        self.Btn_Maintenance.clicked.connect(self.Go_to_Maintenance)
+
+        self.Btn_On_P1.clicked.connect(self.TurnON_P1)
+        self.Btn_off_P1.clicked.connect(self.TurnOFF_P1)
+        self.Btn_on_P2.clicked.connect(self.TurnON_P2)
+        self.Btn_off_P2.clicked.connect(self.TurnOFF_P2)
+        self.Btn_on_Mtbanda.clicked.connect(self.TurnON_Band)
+        self.Btn_off_Mtbanda.clicked.connect(self.TurnOFF_Band)
+
+        self.Btn_On_PClasf1.clicked.connect(self.TurnON_PClasf1)
+        self.Btn_off_PClasf1.clicked.connect(self.TurnOFF_PClasf1)
+        self.Btn_On_PClasf2.clicked.connect(self.TurnON_PClasf2)
+        self.Btn_off_PClasf2.clicked.connect(self.TurnOFF_PClasf2)
+        self.Btn_On_PClasf3.clicked.connect(self.TurnON_PClasf3)
+        self.Btn_off_PClasf3.clicked.connect(self.TurnOFF_PClasf3)
+
+        self.Btn_On_SrvRiel1.clicked.connect(self.TurnON_SrvRiel1)
+        self.Btn_off_SrvRiel1.clicked.connect(self.TurnOFF_SrvRiel1)
+        self.Btn_On_SrvRiel2.clicked.connect(self.TurnON_SrvRiel2)
+        self.Btn_off_SrvRiel2.clicked.connect(self.TurnOFF_SrvRiel2)
+        self.Btn_On_SrvRiel3.clicked.connect(self.TurnON_SrvRiel3)
+        self.Btn_off_SrvRiel3.clicked.connect(self.TurnOFF_SrvRiel3)
+
+        self.Btn_On_SrvCont1.clicked.connect(self.TurnON_SrvCont1)
+        self.Btn_off_SrvCont1.clicked.connect(self.TurnOFF_SrvCont1)
+        self.Btn_On_SrvCont2.clicked.connect(self.TurnON_SrvCont2)
+        self.Btn_off_SrvCont2.clicked.connect(self.TurnOFF_SrvCont2)
+        self.Btn_On_SrvCont3.clicked.connect(self.TurnON_SrvCont3)
+        self.Btn_off_SrvCont3.clicked.connect(self.TurnOFF_SrvCont3)
+
+
+    def Go_to_home(self):
+        self.client1.write_coil(V_ManualMode, 0)
+        self.hide()
+        self.main_window.show()
+
+    def Go_to_Maintenance(self):
+        self.hide()
+        self.main_window.mantenimiento.show()
+
+    def TurnON_P1(self):
+        # Se usa la señal virtual (los COILS)
+        try:
+            self.client1.write_coil(V_Piston_1, 1)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_Piston_1, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_P1(self):
+        try:
+            self.client1.write_coil(V_Piston_1, 0)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_Piston_1, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnON_P2(self):
+        # Se usa la señal virtual (los COILS)
+        try:
+            self.client1.write_coil(V_Piston_2, 1)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_Piston_2, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_P2(self):
+        try:
+            self.client1.write_coil(V_Piston_2, 0)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_Piston_2, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnON_Band(self):
+        # Se usa la señal virtual (los COILS)
+        try:
+            self.client1.write_coil(V_MotB, 1)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_MotB, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_Band(self):
+        try:
+            self.client1.write_coil(V_MotB, 0)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_MotB, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnON_PClasf1(self):
+        try:
+            self.client1.write_coil(V_Clasf1, 1)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_Clasf1, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_PClasf1(self):
+        try:
+            self.client1.write_coil(V_Clasf1, 0)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_Clasf1, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+
+    def TurnON_PClasf2(self):
+        try:
+            self.client1.write_coil(V_Clasf2, 1)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_Clasf2, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_PClasf2(self):
+        try:
+            self.client1.write_coil(V_Clasf2, 0)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_Clasf2, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnON_PClasf3(self):
+        try:
+            self.client1.write_coil(V_Clasf3, 1)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_Clasf3, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_PClasf3(self):
+        try:
+            self.client1.write_coil(V_Clasf3, 0)
+        except ConnectionException as e:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client1.connect()
+                self.client1.write_coil(V_Clasf3, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnON_SrvRiel1(self):
+        try:
+            self.client2.write_coil(V_SrvRiel1, 1)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvRiel1, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_SrvRiel1(self):
+        try:
+            self.client2.write_coil(V_SrvRiel1, 0)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvRiel1, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnON_SrvRiel2(self):
+        try:
+            self.client2.write_coil(V_SrvRiel2, 1)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvRiel2, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_SrvRiel2(self):
+        try:
+            self.client2.write_coil(V_SrvRiel2, 0)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvRiel2, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnON_SrvRiel3(self):
+        try:
+            self.client2.write_coil(V_SrvRiel3, 1)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvRiel3, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_SrvRiel3(self):
+        try:
+            self.client2.write_coil(V_SrvRiel3, 0)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvRiel3, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnON_SrvCont1(self):
+        try:
+            self.client2.write_coil(V_SrvCont1, 1)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvCont1, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_SrvCont1(self):
+        try:
+            self.client2.write_coil(V_SrvCont1, 0)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvCont1, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnON_SrvCont2(self):
+        try:
+            self.client2.write_coil(V_SrvCont2, 1)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvCont2, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+
+    def TurnOFF_SrvCont2(self):
+        try:
+            self.client2.write_coil(V_SrvCont2, 0)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvCont2, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnON_SrvCont3(self):
+        try:
+            self.client2.write_coil(V_SrvCont3, 1)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvCont3, 1)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+    def TurnOFF_SrvCont3(self):
+        try:
+            self.client2.write_coil(V_SrvCont3, 0)
+        except ConnectionException:
+            self.statusbar.showMessage("Error: ESP32 desconectado. Reconectando...")
+            try:
+                self.client2.connect()
+                self.client2.write_coil(V_SrvCont3, 0)
+            except Exception as e:
+                self.statusbar.showMessage(f"Error: {e}")
+
+class MantenimientoModeApp(QtWidgets.QMainWindow):
+    def __init__(self, main_window):
+        super().__init__()
+        uic.loadUi("C:/Users/Ricardo Cabrera/Desktop/prueba2.0/Maintenance.ui", self)
+        self.main_window = main_window
+        self.setWindowTitle('Ventana de mantenimiento')
+        self.client1 = mb_clients["ESP32_1"]
+        self.client2 = mb_clients["ESP32_2"]
+        self.client3 = mb_clients["ESP32_3"]
+
+        self.Btn_ManualMode.clicked.connect(self.Go_to_manual)
+        self.Btn_Home.clicked.connect(self.Go_to_home)
+
+
+        self.client1.read_coils(address=V_Piston_1, count=1)
+        self.client1.read_coils(address=V_Piston_2, count=1)
+        self.client1.read_coils(address=V_MotB, count=1)
+        self.client1.read_coils(address=V_Clasf1, count=1)
+        self.client1.read_coils(address=V_Clasf2, count=1)
+        self.client1.read_coils(address=V_Clasf3, count=1)
+
+        #self.client2.read_coils(address=V_SrvRiel1, count=1)
+        #self.client2.read_coils(address=V_SrvRiel2, count=1)
+        #self.client2.read_coils(address=V_SrvRiel3, count=1)
+        #self.client2.read_coils(address=V_SrvCont1, count=1)
+        #self.client2.read_coils(address=V_SrvCont2, count=1)
+        #self.client2.read_coils(address=V_SrvCont3, count=1)
+
+        self.StyleOn = "background-color: green; border-radius: 15px; border: 2px solid gray;"
+        self.StyleOff = "background-color: red; border-radius: 15px; border: 2px solid gray;"
+
+        self.status_timer = QTimer()
+        self.status_timer.setInterval(500)
+        #self.status_timer.timeout.connect(self.actualizar_indicadores)
+
+        #mapeo de la ESP1
+        #self.indicadores_esp1 = {
+         #   self.Ind_MotB: V_MotB,
+          #  self.Ind_Pst1 : V_Piston_1,
+           # self.Ind_Pst2: V_Piston_2,
+           # self.Ind_Clsf1: V_Clasf1,
+           # self.Ind_Clsf2: V_Clasf2,
+           # self.Ind_Clsf3: V_Clasf3,
+       # }
+
+
+        # Mapeo de la ESP2
+        #self.indicadores_esp2 = {
+         #   self.Ind_Cone1: V_SrvRiel1,
+          #  self.Ind_Cone2: V_SrvRiel2,
+           # self.Ind_Cone3: V_SrvRiel3,
+            #self.Ind_Cont1: V_SrvCont1,
+            #self.Ind_Cont2: V_SrvCont2,
+            #self.Ind_Cont3: V_SrvCont3,
+        #}
+
+
+    def actualizar_indicadores(self):
+        # Actualiza indicadores del CLIENTE 1
+        for label, coil in self.indicadores_esp1.items():
+            try:
+                # Lee el estado del coil
+                estado = self.client1.read_coils(address=coil, count=1).bits[0]
+                if estado:
+                    label.setStyleSheet(self.STYLE_ON)
+                else:
+                    label.setStyleSheet(self.STYLE_OFF)
+            except (ConnectionException, AttributeError):
+                # Si falla la conexión o la lectura, ponlo en OFF
+                label.setStyleSheet(self.STYLE_OFF)
+            except Exception as e:
+                print(f"Error actualizando {coil}: {e}") # Debug
+                label.setStyleSheet(self.STYLE_OFF)
+
+      #  # Actualiza indicadores del CLIENTE 2
+       # for label, coil in self.indicadores_esp2.items():
+        #    try:
+         #       estado = self.client2.read_coils(address=coil, count=1).bits[0]
+           #     if estado:
+          #          label.setStyleSheet(self.STYLE_ON)
+            #    else:
+             #       label.setStyleSheet(self.STYLE_OFF)
+           # except (ConnectionException, AttributeError):
+               # label.setStyleSheet(self.STYLE_OFF)
+            #except Exception as e:
+             #   print(f"Error actualizando {coil}: {e}")
+              #  label.setStyleSheet(self.STYLE_OFF)
+
+
+    def show(self):
+        super().show()
+        self.status_timer.start()
+
+    def hide(self):
+        super().hide()
+        self.status_timer.stop()
+
+    def Go_to_home(self):
+        self.client1.write_coil(V_ManualMode, 0)
+        self.hide()
+        self.main_window.show()
+
+    def Go_to_manual(self):
+        self.client1.write_coil(V_ManualMode, 1)
+        self.main_window.manual_mode.show()
+        self.hide()
+
+
+app = QtWidgets.QApplication(sys.argv)
+main_window = Home()
+main_window.show()
+app.exec_()
+
+for name, c in mb_clients.items():
+    try:
+        c.client.close()
+        print(f"Cerrada conexión con {name}")
+    except Exception as e:
+        print(f"No se pudo cerrar {name}: {e}")
+
+
+   #https://github.com/Slimmer028/Final_ProjectUTL
